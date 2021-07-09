@@ -1,0 +1,6 @@
+build
+openocd.cfg
+compile_commands.json
+tinyusb
+.gdb_history
+.clangd/
