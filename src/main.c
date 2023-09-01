@@ -1,33 +1,9 @@
-#define CFG_TUSB_OS OPT_OS_PICO
-#include "bsp/board.h"
-#include "pico/stdlib.h"
-#include "tusb.h"
-#include "usb_hid_keys.h"
+#include "config.h"
+#include "pico/bootrom.h"
 
-#define REPORT_ID_KEYBOARD 1
-#define MAX_COINCIDENT_KEYS 6
-
-#define N_ROWS 5
-#define N_COLS 4
-
-typedef uint8_t scancode_t;
-
-const uint32_t LED_PIN = PICO_DEFAULT_LED_PIN;
-const uint32_t NUMLOCK_LED_PIN = 11;
-uint8_t keybuffer[MAX_COINCIDENT_KEYS] = {0};
-
-int config_row_map[N_ROWS] = {2, 3, 4, 5, 6};
-int config_column_map[N_COLS] = {7, 8, 9, 10};
-
-static unsigned char keymap[N_ROWS][N_COLS] = {
-    { KEY_NUMLOCK,  KEY_KPSLASH, KEY_KPASTERISK, KEY_KPMINUS },
-    { KEY_KP7,      KEY_KP8,     KEY_KP9,        KEY_KPPLUS },
-    { KEY_KP4,      KEY_KP5,     KEY_KP6,        KEY_NONE },
-    { KEY_KP1,      KEY_KP2,     KEY_KP3,        KEY_NONE },
-    { KEY_NONE,     KEY_KP0, KEY_KPDOT,      KEY_KPENTER }
-};
-
-unsigned char coord_to_scan_code(int column, int row) { return keymap[row][column]; }
+unsigned char coord_to_scan_code(int column, int row, bool fn) { 
+    return fn ? layer1[row][column] : keymap[row][column]; 
+}
 
 /* Blink pattern
  * - 250 ms  : device not mounted
@@ -91,25 +67,113 @@ const char *scancode_to_string(int scancode) {
 }
 
 int 
+get_macro(int row, int col)
+{
+    // keymap overrides macromap, if a key
+    // is defined for the given coordinate
+    // return MACRO_NONE regardless of defined
+    // macros
+    if (keymap[row][col] != KEY_NONE) 
+        return MACRO_NONE;
+
+    return macromap[row][col];
+}
+
+bool
+fn_key_state(int *columns, int *rows)
+{
+    bool fn_pressed = false;
+
+    gpio_put(columns[FN1_COL], 1);
+    sleep_us(10);
+    fn_pressed = gpio_get(rows[FN1_ROW]);
+    gpio_put(columns[FN1_COL], 0);
+
+    return fn_pressed;
+}
+
+void 
+check_special_reset_bootloader(int *columns, int *rows)
+{
+    bool key1, key2, key3;
+
+    // Fn key
+    gpio_put(columns[FN1_COL], 1);
+    sleep_us(10);
+    key1 = gpio_get(rows[FN1_ROW]);
+    gpio_put(columns[FN1_COL], 0);
+    sleep_us(10);
+
+    // backtick key
+    gpio_put(columns[0], 1);
+    sleep_us(10);
+    key2 = gpio_get(rows[1]);
+    gpio_put(columns[0], 0);
+    sleep_us(10);
+        
+    // backspace key
+    gpio_put(columns[13], 1);
+    sleep_us(10);
+    key3 = gpio_get(rows[0]);
+    gpio_put(columns[13], 0);
+    sleep_us(10);
+
+    if (key1 && key2 && key3)
+        reset_usb_boot(0, 0);
+}
+
+
+int 
 poll_columns(int *columns, int *rows, int n_cols, int n_rows) 
 {
+    check_special_reset_bootloader(columns, rows);
+
     int current_key_index = 0;
     memset(keybuffer, 0x0, MAX_COINCIDENT_KEYS);
+
+    modifiers = 0;
+
+    int macro_idx;
+    struct macro macro;
+
+    // Check special keys:
+
+    // Get Fn key state
+    bool fn_state = fn_key_state(columns, rows);
+
+    // poll columns
     for (int col = 0; col < n_cols; ++col) {
         gpio_put(columns[col], 1);
         sleep_us(10);
         for (int row = 0; row < n_rows; ++row) {
             int switch_status = gpio_get(rows[row]);
-            //printf("switch_status for col%d(%d):row%d(%d) - %d\n", col, columns[col], row, rows[row], switch_status);
             if (switch_status) {
-                // printf("%s\n", scancode_to_string(coord_to_scan_code(col, row)));
-                if (current_key_index > MAX_COINCIDENT_KEYS) {
+                if (current_key_index >= MAX_COINCIDENT_KEYS) {
                     memset(keybuffer, 0x01, MAX_COINCIDENT_KEYS);
                     return -1; // too many keys pressed
                 }
-                scancode_t current_scancode = coord_to_scan_code(col, row);
-                keybuffer[current_key_index] = current_scancode;
-                current_key_index++;
+
+                scancode_t current_scancode = coord_to_scan_code(col, row, fn_state);
+
+                // Determine if the pressed key is a modifier, and if so set modifier bits
+                if ((0xe0 & current_scancode) == 0xe0 && (current_scancode & 0x07) < 8) {
+                    modifiers |= 1 << (current_scancode & 7);
+
+                // else determine if key pressed is a macro key, if so set keybuffer
+                // accordingly
+                } else if ((macro_idx = get_macro(row, col)) >= 0) {
+                    macro = macros[macro_idx];
+                    if (current_key_index < MAX_COINCIDENT_KEYS - macro.len)
+                        for (int i = 0; i < macro.len; i++)
+                            keybuffer[current_key_index++] = macro.keycodes[i];
+                    else
+                        return -1; // too many keys pressed
+                                   
+                // otherwise set keybuffer with keycode for pressed key
+                } else {
+                    keybuffer[current_key_index] = current_scancode;
+                    current_key_index++;
+                }
             }
         }
         gpio_put(columns[col], 0);
@@ -176,7 +240,7 @@ static void
 send_hid_report(uint8_t report_id) 
 {
     if ( !tud_hid_ready() ) return;
-    tud_hid_keyboard_report(report_id, 0, keybuffer);
+    tud_hid_keyboard_report(report_id, modifiers, keybuffer);
 }
 
 // Every 10ms, we will send 1 report for each HID profile
@@ -244,7 +308,7 @@ main(void)
         tud_task();
         hid_task();
         led_blinking_task();
-        led_pwm_task();
+        // led_pwm_task();
     }
     return 0;
 }
